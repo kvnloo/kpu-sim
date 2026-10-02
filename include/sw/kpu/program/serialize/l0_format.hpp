@@ -224,13 +224,34 @@ inline float parse_float(const std::string& s, const std::string& where) {
     if (s == "nan")  return std::numeric_limits<float>::quiet_NaN();
     if (s == "inf")  return std::numeric_limits<float>::infinity();
     if (s == "-inf") return -std::numeric_limits<float>::infinity();
+    // Read as double, then narrow. libc++'s operator>> into a float fails on a denormal
+    // (strtof reports ERANGE, and the stream turns that into failbit), so denorm_min did not
+    // read back on macOS; as a double it is an ordinary value. Narrowing is exact for what
+    // exact_float writes: 9 significant digits put the text within ~5e-9 (relative) of its
+    // float, far from any rounding midpoint, so the double step cannot double-round.
+    // std::from_chars(float) would avoid the detour, but needs macOS 26 at runtime.
     std::istringstream is(s);
     is.imbue(std::locale::classic());       // never the caller's decimal separator
-    float v = 0.0f;
-    is >> v;
+    double d = 0.0;
+    is >> d;
     if (!is || !is.eof())
         throw FormatError(FormatError::Cause::MalformedRecord,
                           "l0: " + where + ": '" + s + "' is not a number");
+    // RANGE IS CHECKED BEFORE THE CAST: narrowing a finite double outside float's range is
+    // undefined behaviour, so testing the result for inf afterwards would be too late. The
+    // bound is FLT_MAX plus half an ulp, the first value that rounds to inf, rather than
+    // FLT_MAX itself -- FLT_MAX's own 9-digit text is slightly above FLT_MAX as a double,
+    // yet rounds back to it.
+    constexpr double kFirstOverflow = 0x1.ffffffp+127;
+    if (std::fabs(d) >= kFirstOverflow)
+        throw FormatError(FormatError::Cause::MalformedRecord,
+                          "l0: " + where + ": '" + s + "' is outside the range of a float");
+    const float v = static_cast<float>(d);
+    // Underflow to zero would silently change the value; a denormal is kept exactly.
+    if (v == 0.0f && d != 0.0)
+        throw FormatError(FormatError::Cause::MalformedRecord,
+                          "l0: " + where + ": '" + s + "' is too small for a float, and "
+                          "would read back as zero");
     return v;
 }
 
