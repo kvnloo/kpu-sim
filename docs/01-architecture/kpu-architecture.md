@@ -762,8 +762,8 @@ The KPU architecture scales across multiple product families targeting different
 - Scalable pattern: larger dies simply extend the checkerboard grid
 
 **Tile Composition**
-- Compute tile: Contains a systolic fabric array, L2 scratchpad, L1 stream buffers, Streamers, and BlockMovers
-- L3 memory tile: Contains distributed scratchpad SRAM banks with local addressing and routing
+- Compute tile: Contains a nearest neighbor processor array, L2 scratchpad, L1 stream buffers, and Streamers
+- L3 memory tile: Contains distributed scratchpad SRAM banks with local addressing, Block Movers that transfer blocks from L3 to L2, or between L3s, and routing hub that connects to its nearest neighbor L3 tiles.
 
 **Design Constraint**
 - Fabric dimensions (PE array size) are constrained by L3 tile and compute tile physical dimensions
@@ -781,7 +781,11 @@ The KPU architecture scales across multiple product families targeting different
 
 **Configuration**
 - Compute tiles: 64
-- Die organization: 8×8 checkerboard (4×4 compute tiles alternating with L3 tiles)
+- Die organization: 8×8 checkerboard (4×4 L3 tiles alternating with Compute tiles)
+- Topology: a folded 2D torus, 4x4 in loops, with 8 L3 hubs on each ring
+- Fold ends are ports: the fold-end link of each row and column loop is where traffic enters or leaves the ring. DMA channels connect there.
+- Provisional connectivity: we do not know yet how well this connectivity works for the schedules, so the NoC architecture is TBD.
+- First pass: each L3 tile connects to four compute tiles that abut it W/N/E/S. Each L3 tile edge that connects to a Compute Tile will have an addressable Block Mover that can push/pull data into the Compute Tile.
 - Fabric size per compute tile: 16×16 to 32×32 PEs (total: 16K-64K PEs)
 - Target process technology: 22nm (cost-optimized for edge deployment)
 
