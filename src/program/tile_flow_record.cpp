@@ -7,6 +7,7 @@
 // Copyright (c) 2024-2025 Stillwater Supercomputing, Inc.
 // ============================================================================
 #include <sw/kpu/program/record/tile_flow_record.hpp>
+#include <sw/kpu/program/record/tile_flow_lod.hpp>
 
 #include <sw/kpu/program/platform/deployment_json.hpp>
 #include <sw/kpu/program/tile_transaction_executor.hpp>
@@ -97,6 +98,9 @@ TileFlowRecord build_record(const TileProgram& prog, const driver::RunOutcome& o
     for (Dim c = 0; c < n_cf; ++c)
         rec.stations.push_back({d.name + "/cf[" + std::to_string(c) + "]", "cf", 1, false, true});
     const std::uint32_t DRAM = 0, L3 = 1, L2 = 2, L1 = 3, CF0 = 4;
+    if (outcome.stats)
+        for (const auto& [m, lanes] : outcome.stats->mover_lanes)
+            rec.movers.push_back({to_string(m), lanes});
 
     // ---- tiles and ops, in first-appearance order (deterministic)
     std::map<std::string, std::uint32_t> tile_of;
@@ -112,9 +116,17 @@ TileFlowRecord build_record(const TileProgram& prog, const driver::RunOutcome& o
     for (const TileOp& op : ops) {
         Op o;
         o.kind = static_cast<std::uint8_t>(op.kind);
-        std::set<std::uint32_t> seen;
-        for (const TileCoord& c : op.inputs) if (seen.insert(tile_id(c)).second) o.tiles.push_back(tile_id(c));
-        for (const TileCoord& c : op.outputs) if (seen.insert(tile_id(c)).second) o.tiles.push_back(tile_id(c));
+        std::map<std::uint32_t, std::size_t> at;          // tile -> position in o.tiles
+        auto touch = [&](const TileCoord& c, bool writes) {
+            const std::uint32_t id = tile_id(c);
+            const auto it = at.find(id);
+            if (it != at.end()) { if (writes) o.written[it->second] = 1; return; }
+            at.emplace(id, o.tiles.size());
+            o.tiles.push_back(id);
+            o.written.push_back(writes ? 1 : 0);
+        };
+        for (const TileCoord& c : op.inputs) touch(c, false);
+        for (const TileCoord& c : op.outputs) touch(c, true);
         rec.ops.push_back(std::move(o));
     }
 
@@ -277,7 +289,9 @@ void write_tflow(const TileFlowRecord& rec, const std::string& dir) {
 
     json m = json::object();
     m["format"] = "kpu-tflow";
-    m["version"] = 1;
+    // 2: op_tiles gained `written` (#286 step 3). A version-1 bundle cannot answer "was this
+    // slot filled", so it is refused with a message, not read as "nothing writes".
+    m["version"] = 2;
     m["level"] = rec.level;
     m["device"] = rec.device;
     m["device_label"] = rec.device_label;
@@ -290,6 +304,9 @@ void write_tflow(const TileFlowRecord& rec, const std::string& dir) {
         st.push_back(json{{"name", s.name}, {"kind", s.kind}, {"capacity", s.capacity},
                           {"pooled", s.pooled}, {"modelled", s.modelled}});
     m["stations"] = st;
+    json mv = json::array();
+    for (const MoverPool& p : rec.movers) mv.push_back(json{{"name", p.name}, {"lanes", p.lanes}});
+    m["movers"] = mv;
     json tl = json::array();
     for (const Tile& t : rec.tiles) tl.push_back(json::array({t.operand, t.ti, t.tj}));
     m["tiles"] = tl;
@@ -335,14 +352,16 @@ void write_tflow(const TileFlowRecord& rec, const std::string& dir) {
     }
     {
         Table t{"op_tiles", "op_tiles.bin", rec.ops.size(), {}};
-        std::vector<std::uint8_t> kind;
+        std::vector<std::uint8_t> kind, written;
         std::vector<std::uint32_t> offset{0}, tile;
         for (const Op& o : rec.ops) {
             kind.push_back(o.kind);
             tile.insert(tile.end(), o.tiles.begin(), o.tiles.end());
+            written.insert(written.end(), o.written.begin(), o.written.end());
             offset.push_back(static_cast<std::uint32_t>(tile.size()));
         }
         t.put("kind", "u8", kind); t.put("offset", "u32", offset); t.put("tile", "u32", tile);
+        t.put("written", "u8", written);
         tables["op_tiles"] = write_table(t, dir);
     }
     m["tables"] = tables;
@@ -350,6 +369,10 @@ void write_tflow(const TileFlowRecord& rec, const std::string& dir) {
     std::ofstream out(dir + "/manifest.json", std::ios::binary);
     out << m.dump(1) << "\n";
     if (!out) throw RecordError("record: cannot write " + dir + "/manifest.json");
+
+    // The pyramid is derived, so it is written beside the record rather than inside it: a
+    // consumer that wants only the record never reads it, and the checker verifies it.
+    write_lod(build_lod(rec), dir);
 }
 
 namespace {
@@ -392,9 +415,12 @@ TileFlowRecord read_tflow(const std::string& dir) {
         throw RecordError(std::string("record: manifest is not valid JSON: ") + e.what());
     }
     if (m.value("format", "") != "kpu-tflow") throw RecordError("record: not a kpu-tflow bundle");
-    if (m.value("version", 0) != 1)
+    if (m.value("version", 0) == 1)
+        throw RecordError("record: a version-1 bundle has no op_tiles.written column; re-record "
+                          "it with this build's kpu-run --tflow");
+    if (m.value("version", 0) != 2)
         throw RecordError("record: version " + std::to_string(m.value("version", 0)) +
-                          " is not one this build reads (1)");
+                          " is not one this build reads (2)");
     TileFlowRecord rec;
     rec.level = m.at("level").get<std::string>();
     rec.device = m.at("device").get<std::string>();
@@ -407,6 +433,9 @@ TileFlowRecord read_tflow(const std::string& dir) {
         rec.stations.push_back({s.at("name").get<std::string>(), s.at("kind").get<std::string>(),
                                 s.at("capacity").get<std::uint64_t>(), s.at("pooled").get<bool>(),
                                 s.at("modelled").get<bool>()});
+    if (m.contains("movers"))
+        for (const json& p : m.at("movers"))
+            rec.movers.push_back({p.at("name").get<std::string>(), p.at("lanes").get<Dim>()});
     for (const json& t : m.at("tiles"))
         rec.tiles.push_back({t.at(0).get<std::string>(), t.at(1).get<Dim>(), t.at(2).get<Dim>()});
 
@@ -476,8 +505,11 @@ TileFlowRecord read_tflow(const std::string& dir) {
                 throw RecordError("record: op_tiles offset " + std::to_string(i + 1) +
                                   " decreases; the op tile table is corrupt");
         const auto tile = read_col<std::uint32_t>(t, b, "tile", "u32", n ? offset[n] : 0);
+        const auto written = read_col<std::uint8_t>(t, b, "written", "u8", n ? offset[n] : 0);
         for (std::size_t i = 0; i < n; ++i)
-            rec.ops.push_back({kind[i], std::vector<std::uint32_t>(tile.begin() + offset[i], tile.begin() + offset[i + 1])});
+            rec.ops.push_back({kind[i],
+                               std::vector<std::uint32_t>(tile.begin() + offset[i], tile.begin() + offset[i + 1]),
+                               std::vector<std::uint8_t>(written.begin() + offset[i], written.begin() + offset[i + 1])});
     }
     // Every index points into its table, so a consumer (the occupancy sweep, the viewer) can
     // index without checking -- the checks are here, once, at the trust boundary.
