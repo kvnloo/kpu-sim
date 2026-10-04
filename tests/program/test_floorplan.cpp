@@ -31,6 +31,7 @@ namespace {
 const char* kDeploy = "tests/program/deploy/";
 
 DeploymentSpec t64() { return read_spec_file(std::string(kDeploy) + "kpu_t64.json"); }
+DeploymentSpec t4() { return read_spec_file(std::string(kDeploy) + "kpu_t4.json"); }
 
 ArrayLayout t64_layout() {
     std::string why;
@@ -162,6 +163,73 @@ TEST_CASE("the NoC is a folded 2D torus: 4x4 loops of 8 hubs, with fold-end port
     CHECK(seen.size() == 32);
 }
 
+// ---- the T4: the reference SKU for evaluating schedules --------------------------
+// Small enough to read every tile movement in the viewer: a 2x2 board, two 64x64-PE compute
+// tiles (4096 MACs per cycle each), two L3 tiles, one memory controller with 8 DMA engines.
+TEST_CASE("the T4 is a 2x2 alternating board whose L3 tiles each feed both compute tiles",
+          "[program][platform][layout][t4]") {
+    std::string why;
+    const auto L = ArrayLayout::of(t4().device(0), &why);
+    REQUIRE(L.has_value());
+    CHECK(L->rows() == 2);
+    CHECK(L->cols() == 2);
+    CHECK(L->l3_count() == 2);
+    CHECK(L->cf_count() == 2);
+    CHECK(L->cell(0, 0).kind == CellKind::L3);
+    CHECK(L->cell(1, 1).kind == CellKind::L3);
+    CHECK(L->cell(0, 1).kind == CellKind::Compute);
+    CHECK(L->cell(1, 0).kind == CellKind::Compute);
+
+    // Each L3 tile abuts both compute tiles, so there are 2 x 2 BlockMovers and every
+    // (L3, compute) pair has its own.
+    REQUIRE(L->block_movers().size() == 4);
+    std::map<Dim, std::set<Edge>> edges;
+    std::set<std::pair<Dim, Dim>> pairs;
+    for (const BlockMoverSite& m : L->block_movers()) {
+        edges[m.l3].insert(m.edge);
+        pairs.insert({m.l3, m.cf});
+    }
+    CHECK(edges[L->cell(0, 0).index] == std::set<Edge>{Edge::E, Edge::S});
+    CHECK(edges[L->cell(1, 1).index] == std::set<Edge>{Edge::N, Edge::W});
+    CHECK(pairs.size() == 4);
+
+    // The torus degenerates: the row loop and the column loop are the same two-hub ring, so
+    // the NoC is ONE wire between the two L3 hubs, still with four fold-end ports.
+    REQUIRE(L->has_noc());
+    REQUIRE(L->loops().size() == 2);
+    const std::vector<Dim> ring = {L->cell(0, 0).index, L->cell(1, 1).index};
+    for (const NocLoop& loop : L->loops()) CHECK(loop.hubs == ring);
+    CHECK(L->links().size() == 1);
+    REQUIRE(L->ports().size() == 4);
+    CHECK(L->ports()[0].label() == "row0.W");
+    CHECK(L->ports()[3].label() == "col0.S");
+}
+
+TEST_CASE("the generated T4 floorplan places every resource exactly once",
+          "[program][platform][floorplan][t4]") {
+    const DeploymentSpec spec = t4();
+    REQUIRE(spec.validate().empty());
+    const SocFloorplan fp = generate_floorplan(spec);
+    CHECK(validate_floorplan(fp, spec).empty());
+
+    const auto n = kind_counts(fp);
+    CHECK(n.at(BlockKind::L3Tile) == 2);
+    CHECK(n.at(BlockKind::ComputeTile) == 2);
+    CHECK(n.at(BlockKind::BlockMover) == 4);
+    CHECK(n.at(BlockKind::NocRouter) == 2);
+    CHECK(n.at(BlockKind::NocPort) == 4);
+    CHECK(n.at(BlockKind::MemoryController) == 1);
+    CHECK(n.at(BlockKind::DmaEngine) == 8);
+    CHECK(n.at(BlockKind::CpuHart) == 1);
+    CHECK(n.at(BlockKind::L3Bank) == 2 * 4);
+
+    std::map<NocLink::Kind, std::size_t> links;
+    for (const NocLink& l : fp.noc) ++links[l.kind];
+    CHECK(links[NocLink::Kind::Ring] == 1);
+    CHECK(links[NocLink::Kind::Port] == 8);
+    CHECK(links[NocLink::Kind::Attach] == 8);   // every DMA engine, round-robin over the N/S ports
+}
+
 TEST_CASE("a spec that describes no layout has none, and says why",
           "[program][platform][layout]") {
     // The checked-in 16-CF / 8-L3 fixture is a valid deployment with no alternating layout.
@@ -205,7 +273,7 @@ TEST_CASE("the generated T64 floorplan places every resource exactly once",
     CHECK(n.at(BlockKind::NocRouter) == 32);
     CHECK(n.at(BlockKind::NocPort) == 16);
     CHECK(n.at(BlockKind::MemoryController) == 4);
-    CHECK(n.at(BlockKind::DmaEngine) == 8);
+    CHECK(n.at(BlockKind::DmaEngine) == 32);                // 8 per memory controller
     CHECK(n.at(BlockKind::CpuHart) == 4);
     CHECK(n.at(BlockKind::L3Bank) == 32 * 4);
 
@@ -216,12 +284,17 @@ TEST_CASE("the generated T64 floorplan places every resource exactly once",
     CHECK(fp.find("t64/l3[0]/bm[0]") == nullptr);           // a corner has no N mover
 
     // The NoC's wires: 60 ring links (64 loop links, four shared at the corners), two port links per port, and one DMA attachment per
-    // N/S port in the first pass (W/E ports start unattached).
+    // engine in the first pass, spread over its controller's N/S ports (W/E start unattached).
     std::map<NocLink::Kind, std::size_t> links;
     for (const NocLink& l : fp.noc) ++links[l.kind];
     CHECK(links[NocLink::Kind::Ring] == 60);
     CHECK(links[NocLink::Kind::Port] == 32);
-    CHECK(links[NocLink::Kind::Attach] == 8);
+    CHECK(links[NocLink::Kind::Attach] == 32);
+    std::map<std::string, int> per_port;
+    for (const NocLink& l : fp.noc)
+        if (l.kind == NocLink::Kind::Attach) ++per_port[l.b];
+    CHECK(per_port.size() == 8);                             // the 8 N/S ports, 4 engines each
+    for (const auto& [port, k] : per_port) CHECK(k == 4);
 }
 
 TEST_CASE("the die holds everything placed, even when the CPU is taller than the array",

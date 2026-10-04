@@ -22,6 +22,7 @@ correct, not buried in the section it came from.
 | **Q2 L3 at L-T1** | **Pooled first.** Step 1 draws L3 as one pooled station, labelled as such. Slot binding (step 6) is a separate, reviewed executor model change |
 | **Q3a floorplan source** | **The generator is the reference** until a real SoC floorplan exists. The importer comes later |
 | **Q3b T64 size** | **64 compute tiles.** The checkerboard dimensions in `kpu-architecture.md` §5.2.1 are wrong and are corrected with the §5.1 amendment (step 1). The 8×8 diagram in §3.1 stays illustrative |
+| **Reference SKU** (2026-10-04) | **The KPU-T4** (`tests/program/deploy/kpu_t4.json`, `kpu-architecture.md` §5.2.0) is the SKU the debugger is tested and demonstrated on. The T64 has too many resources to evaluate a schedule by eye. The T4 is a 2×2 board: 2 compute tiles of 64×64 PEs (4096 MACs/cycle each), 2 L3 tiles of 64 slots, 4 BlockMovers, 1 memory controller with 8 DMA engines. Its torus is one wire. A 512³ matmul in 64×64 tiles is 1600 ops, so every movement can be read. The T64 stays as the scale test |
 | **Q4 CPU detail** | **Cores + SRAM + descriptor/completion rings** as separate blocks |
 | **Q5 viewer** | **Plain static HTML + Canvas2D**, with WebGL for dense pixel layers, and no build step |
 | **Q6 colour** | **By operator class**, with individual operators on hover and in the phase strip |
@@ -512,6 +513,42 @@ residency.
 
 4. **Viewer, Step 1.** In `tools/visualization/tileflow/index.html`, plus modules, build views
    1a/1b/1c and the diagnostics. Add a `kpu-run --tflow <dir>` flag.
+
+   **Done (2026-10-04).** `tools/visualization/tileflow/index.html` is one static file with no
+   build step and no server. It draws the floorplan at the cursor, swimlanes from the pyramid
+   (the finest level that fits the pixels, drag to zoom), the exact pooled-L3 occupancy against
+   capacity, and diagnostics: L3 peak, compute utilization, per-pool lane use, and
+   movement-bound windows. `pack.py` embeds a bundle and a floorplan into one shareable HTML
+   file. A smoke test packs a real bundle and syntax-checks the script. The `kpu-run --tflow`
+   flag landed in step 2. Following §3.6, L3 and the movers are drawn as **pooled** fills
+   across every block of their kind and labelled so, and blocks with no events at the level
+   (CPU, ports, L2, L1) are hatched. The viewer does not re-check invariants; it points at
+   `tflow_check.py`.
+
+   **Per-resource rows by a derived binding (2026-10-04, at the architect's request).** The
+   swimlanes are organized by resource class:
+   - a DRAM address map from 0 to the top of memory, with the tensors placed and queryable;
+   - memory controllers, and their DMA engines (8 per controller in the T64 fixture);
+   - every L3 tile, every compute tile, the NoC fold ports, and the NoC hubs.
+
+   Q2 stands: the executor still pools L3. The places come from `bind.py`, which derives
+   them by stated policies, changes no timing, and is labelled "derived" wherever it shows.
+   The policies:
+   - **DRAM:** tile-major layout, 4 KiB aligned;
+   - **DMA:** the controller chosen by address, tile-interleaved, then its first free
+     engine, with overload counted;
+   - **L3:** each tile homed in the least-loaded L3 tile abutting its next consumer;
+   - **BlockMover:** the mover on the home tile facing the destination compute tile, else a
+     NoC relay;
+   - **NoC:** each DMA burst on a shortest path from its engine's port to the home hub.
+
+   The first DMA policy, "lane i is engine i", put almost all traffic on controller 0. The
+   executor takes the lowest free lane, so the picture was an artifact of the mapping, not a
+   finding. The address interleave replaced it. On a 512³ matmul it shows 115 transfers
+   arriving while every engine of their controller is busy. The floorplan now attaches every
+   DMA engine to one of its controller's fold ports, in turn. Step 6 replaces the L3 and
+   BlockMover policies with the executor's own binding.
+
 5. **Cause edges and lineage, Step 2.** Add the #286 causality plumbing and `CauseKind`, then
    views 2a/2b.
 6. **L3 slot binding.** This is a deliberate executor model change, with its own design note:
