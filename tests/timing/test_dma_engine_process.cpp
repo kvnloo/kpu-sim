@@ -163,49 +163,55 @@ TEST_CASE("DMAEngineProcess multiple loads through MC", "[timing][dma_process]")
 // Store Tests
 // ============================================================================
 
-TEST_CASE("DMAEngineProcess store requires tile in L3", "[timing][dma_process]") {
+TEST_CASE("DMAEngineProcess store waits for its tile in the store buffer, not in L3",
+          "[timing][dma_process]") {
+    // Every hop is a push: a BlockMover ejects the tile into the engine's store buffer, and
+    // the engine writes from there. The engine never reads L3, so a tile sitting in L3 does
+    // not start a store.
     CreditPool l3_credits(8);
     TagCAM l3_tag_cam(8);
     MemoryControllerProcess mc(default_mc_config());
 
     DMAEngineProcess dma(default_dma_config(0), mc, l3_credits, l3_tag_cam);
 
-    // Schedule a store without tile in L3
     auto tile = make_load_tile(MatrixID::C, 0, 0);
-    dma.schedule_store(tile);
+    const uint64_t ticket = dma.schedule_store(tile);
 
-    // Tick - should stall (tile not in L3)
     auto events = dma.tick(0);
     REQUIRE(count_events(events, EventType::DMA_STALL_TAG) == 1);
-    REQUIRE(dma.has_pending_work());  // Still queued
-    REQUIRE(dma.is_idle());  // Nothing submitted to MC
+    REQUIRE(dma.has_pending_work());
+    REQUIRE(dma.is_idle());
 
-    // Add tile to L3 TagCAM (simulating it arrived)
-    l3_credits.acquire();  // Simulate credit used
+    // In L3 is not enough.
+    l3_credits.acquire();
     l3_tag_cam.insert(tile.tile_id, 0, 0);
-
-    // Now tick should submit to MC
     events = dma.tick(1);
-    REQUIRE(mc.has_pending_work());  // Request submitted to MC
+    REQUIRE(count_events(events, EventType::DMA_STALL_TAG) == 1);
+    REQUIRE_FALSE(mc.has_pending_work());
+
+    // A BlockMover's ejection lands it in the buffer: now the engine writes it.
+    REQUIRE(dma.store_buffer().reserve());
+    dma.store_buffer().deliver(ticket);
+    events = dma.tick(2);
+    REQUIRE(mc.has_pending_work());
 }
 
-TEST_CASE("DMAEngineProcess store releases credit on completion", "[timing][dma_process]") {
+TEST_CASE("DMAEngineProcess store frees its buffer slot on completion and leaves L3 alone",
+          "[timing][dma_process]") {
     CreditPool l3_credits(8);
     TagCAM l3_tag_cam(8);
     MemoryControllerProcess mc(default_mc_config());
 
-    DMAEngineProcess dma(default_dma_config(0), mc, l3_credits, l3_tag_cam);
+    auto cfg = default_dma_config(0);
+    cfg.store_buffer_blocks = 1;
+    DMAEngineProcess dma(cfg, mc, l3_credits, l3_tag_cam);
 
-    // Pre-populate L3 with a tile
     auto tile = make_load_tile(MatrixID::C, 0, 0);
-    l3_credits.acquire();
-    l3_tag_cam.insert(tile.tile_id, 0, 0);
-    REQUIRE(l3_credits.available() == 7);
+    const uint64_t ticket = dma.schedule_store(tile);
+    REQUIRE(dma.store_buffer().reserve());
+    REQUIRE_FALSE(dma.store_buffer().reserve());       // one slot, and it is held
+    dma.store_buffer().deliver(ticket);
 
-    // Schedule store
-    dma.schedule_store(tile);
-
-    // Run until complete
     Cycle cycle = 0;
     while ((!mc.is_complete() || !dma.is_complete()) && cycle < 100) {
         mc.tick(cycle);
@@ -214,8 +220,45 @@ TEST_CASE("DMAEngineProcess store releases credit on completion", "[timing][dma_
     }
 
     REQUIRE(dma.is_complete());
-    REQUIRE(l3_credits.available() == 8);  // Credit released
-    REQUIRE_FALSE(l3_tag_cam.lookup(tile.tile_id));  // Tile removed from L3
+    REQUIRE(dma.store_buffer().held() == 0);           // the write returned the slot
+    REQUIRE(dma.store_buffer().staged_count() == 0);
+    REQUIRE(dma.total_bytes_stored() == tile.size_bytes);
+    REQUIRE(l3_credits.available() == 8);              // L3 was never the engine's to touch
+}
+
+TEST_CASE("DMAEngineProcess writes two stores of one tile one after the other",
+          "[timing][dma_process]") {
+    // Two stores of the same tile are two tickets, two buffer slots and two writes. The MC's
+    // completion names the tile, not the store, so the engine writes them one at a time:
+    // that keeps the match unambiguous and write-after-write in order.
+    CreditPool l3_credits(8);
+    TagCAM l3_tag_cam(8);
+    MemoryControllerProcess mc(default_mc_config());
+    DMAEngineProcess dma(default_dma_config(0), mc, l3_credits, l3_tag_cam);
+
+    auto tile = make_load_tile(MatrixID::C, 0, 0);
+    const uint64_t t1 = dma.schedule_store(tile);
+    const uint64_t t2 = dma.schedule_store(tile);
+    REQUIRE(t1 != t2);
+    for (uint64_t t : {t1, t2}) {
+        REQUIRE(dma.store_buffer().reserve());
+        dma.store_buffer().deliver(t);
+    }
+
+    dma.tick(0);
+    REQUIRE(mc.pending_requests() == 1);        // the second waits for the first
+
+    std::size_t retired = 0;
+    Cycle cycle = 0;
+    while ((!mc.is_complete() || !dma.is_complete()) && cycle < 1000) {
+        mc.tick(cycle);
+        retired += count_events(dma.tick(cycle), EventType::DMA_STORE_RETIRED);
+        cycle++;
+    }
+    REQUIRE(dma.is_complete());
+    REQUIRE(retired == 2);
+    REQUIRE(dma.store_buffer().held() == 0);
+    REQUIRE(dma.total_bytes_stored() == 2 * tile.size_bytes);
 }
 
 // ============================================================================
@@ -233,11 +276,11 @@ TEST_CASE("DMAEngineProcess interleaved loads and stores", "[timing][dma_process
     dma.schedule_load(make_load_tile(MatrixID::A, 0, 0));
     dma.schedule_load(make_load_tile(MatrixID::A, 0, 1));
 
-    // Pre-populate C tile for store
+    // A C tile already ejected into the store buffer
     auto c_tile = make_load_tile(MatrixID::C, 0, 0);
-    l3_credits.acquire();
-    l3_tag_cam.insert(c_tile.tile_id, 0, 0);
-    dma.schedule_store(c_tile);
+    const uint64_t ticket = dma.schedule_store(c_tile);
+    REQUIRE(dma.store_buffer().reserve());
+    dma.store_buffer().deliver(ticket);
 
     // First tick - should submit 2 loads and 1 store to MC
     auto dma_events = dma.tick(0);

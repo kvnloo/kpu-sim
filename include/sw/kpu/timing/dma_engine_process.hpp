@@ -31,18 +31,58 @@
 namespace sw::kpu::timing {
 
 /**
+ * @brief A DMA engine's store buffer: tiles ejected out of L3, waiting for their DRAM write
+ *
+ * Push-with-credit on both sides. A BlockMover reserve()s a slot before it starts an
+ * ejection and deliver()s the store's TICKET when the ejection lands. The engine take()s a
+ * staged ticket when it starts the DRAM write, and release()s the slot when the write
+ * completes. Entries are per store, not per tile: two stores of one tile are two tickets,
+ * two slots and two writes.
+ */
+class DmaStoreBuffer {
+public:
+    explicit DmaStoreBuffer(size_t blocks) : credits_(blocks) {}
+
+    bool reserve() { return credits_.acquire(); }
+    void deliver(uint64_t ticket) { staged_.insert(ticket); }
+    [[nodiscard]] bool staged(uint64_t ticket) const { return staged_.count(ticket) != 0; }
+    void take(uint64_t ticket) { staged_.erase(ticket); }
+    void release() { credits_.release(); }
+
+    [[nodiscard]] size_t capacity() const { return credits_.capacity(); }
+    [[nodiscard]] size_t held() const { return credits_.outstanding(); }
+    [[nodiscard]] size_t staged_count() const { return staged_.size(); }
+    void reset() {
+        credits_.reset();
+        staged_.clear();
+    }
+
+private:
+    CreditPool credits_;
+    std::unordered_set<uint64_t> staged_;
+};
+
+/**
  * @brief DMA Engine Process for DRAM ↔ L3 transfers
  *
  * The DMA engine handles:
  * - Loading tiles from DRAM to L3 (requires L3 credit)
- * - Storing tiles from L3 to DRAM (requires tile in L3 TagCAM)
+ * - Storing tiles to DRAM from its own STORE BUFFER
+ *
+ * EVERY HOP IS A PUSH (docs/plans/noc-port-arbitration.md step 3; CSP tier, step 4b.2).
+ * A store is not a DMA read of L3, which the machine does not have. A BlockMover ejects
+ * the tile out of L3 into this engine's store buffer (BlockMoverProcess::schedule_eject),
+ * holding one of the buffer's slots, and freeing the L3 slot when the ejection lands.
+ * The engine then writes the buffer to DRAM and frees the buffer slot when the write
+ * completes.
  *
  * The DMA engine uses a Memory Controller for actual DRAM access. Multiple
  * DMA engines can share a single MC (realistic for multi-channel configs).
  *
  * Credit flow:
  * - LOAD: Must acquire L3 credit before submitting to MC (buffer space needed)
- * - STORE: Must match tile in L3 TagCAM before submitting to MC
+ * - STORE: the BlockMover takes a store-buffer credit before it ejects; the engine
+ *   writes once the tile is in its buffer, and returns the credit on write completion
  *
  * Concurrency:
  * - DMA engine queues requests, MC processes them with contention
@@ -58,6 +98,8 @@ public:
         size_t queue_depth = 32;       ///< Max requests concurrently submitted to the MC
         size_t l3_credit_reserve = 0;  ///< L3 credits loads may NOT consume (reserved for
                                        ///< downstream writebacks; prevents credit starvation)
+        size_t store_buffer_blocks = 2;  ///< Tiles the store buffer holds: ejected out of L3,
+                                         ///< waiting for or in their DRAM write
         std::string name = "DMA";      ///< Human-readable name
 
         /// Generate human-readable name
@@ -85,6 +127,7 @@ public:
         RequestState state;
         Cycle enqueue_cycle;
         uint32_t slot_id = 0;    ///< L3 slot for this tile (for loads)
+        uint64_t ticket = 0;     ///< Stores: this store's identity in the store buffer
     };
 
     /**
@@ -102,6 +145,7 @@ public:
           mc_(mc),
           l3_credits_(l3_credits),
           l3_tag_cam_(l3_tag_cam),
+          store_buffer_(config.store_buffer_blocks),
           next_slot_id_(0) {
     }
 
@@ -127,22 +171,28 @@ public:
     }
 
     /**
-     * @brief Schedule a tile store from L3 to DRAM
+     * @brief Schedule a tile store from this engine's store buffer to DRAM
      * @param tile Tile descriptor with DRAM address and size
      *
      * The tile will be stored when:
-     * 1. The tile is present in L3 (TagCAM match)
-     * 2. MC can accept the request
+     * 1. A BlockMover has ejected it into store_buffer(), under the returned ticket
+     * 2. No other store of the same tile is being written by this engine (the MC's
+     *    completion names the tile, not the store, and write-after-write stays ordered)
+     * 3. MC can accept the request
+     *
+     * @return the store's ticket; the BlockMover's ejection must deliver it
      */
-    void schedule_store(const TileDescriptor& tile) {
+    uint64_t schedule_store(const TileDescriptor& tile) {
         // Staging queue accepts every scheduled request (see schedule_load).
         PendingRequest req;
         req.tile = tile;
         req.is_load = false;
         req.state = RequestState::WAITING_TAG;
         req.enqueue_cycle = current_cycle_;
+        req.ticket = (static_cast<uint64_t>(config_.engine_id) << 40) | ++next_ticket_;
 
         pending_requests_.push_back(req);
+        return req.ticket;
     }
 
     /**
@@ -206,7 +256,10 @@ public:
 
     void reset() override {
         pending_requests_.clear();
+        store_buffer_.reset();
         submitted_load_tiles_.clear();
+        submitted_store_tiles_.clear();
+        next_ticket_ = 0;
         next_slot_id_ = 0;
         stall_cycles_credit_ = 0;
         stall_cycles_tag_ = 0;
@@ -261,14 +314,21 @@ public:
         return config_;
     }
 
+    /// Where a BlockMover ejects this engine's stores (schedule_eject).
+    [[nodiscard]] DmaStoreBuffer& store_buffer() { return store_buffer_; }
+    [[nodiscard]] const DmaStoreBuffer& store_buffer() const { return store_buffer_; }
+
 private:
     Config config_;
     MemoryControllerProcess& mc_;
     CreditPool& l3_credits_;
     TagCAM& l3_tag_cam_;
+    DmaStoreBuffer store_buffer_;
 
     std::vector<PendingRequest> pending_requests_;
     std::unordered_set<TileID, TileIDHash> submitted_load_tiles_;
+    std::unordered_set<TileID, TileIDHash> submitted_store_tiles_;   // one write per tile at a time
+    uint64_t next_ticket_ = 0;
 
     Cycle current_cycle_ = 0;
     uint32_t next_slot_id_ = 0;
@@ -309,22 +369,15 @@ private:
                         events.back().matrix_base_address = completed->tile.matrix_base_address;
                         events.back().dram_address = completed->tile.dram_address;
                     } else {
-                        // Store complete: tile written to DRAM
+                        // Store complete: the tile is in DRAM, and its store-buffer slot is
+                        // free. L3 was freed when the BlockMover's ejection landed.
                         total_bytes_stored_ += completed->tile.size_bytes;
-
-                        // Invalidate tile in L3 and release credit
-                        bool released = l3_tag_cam_.invalidate(completed->tile.tile_id);
-                        if (released) {
-                            l3_credits_.release(
-                                static_cast<size_t>(completed->tile.tile_id.matrix));
-                            events.push_back(TimingEvent(
-                                EventType::CREDIT_RELEASED,
-                                current_cycle_,
-                                config_.engine_id,
-                                completed->tile.tile_id,
-                                name()
-                            ));
-                        }
+                        store_buffer_.release();
+                        submitted_store_tiles_.erase(completed->tile.tile_id);
+                        events.push_back(TimingEvent(EventType::DMA_STORE_RETIRED, current_cycle_,
+                                                     config_.engine_id, completed->tile.tile_id,
+                                                     name()));
+                        events.back().store_ticket = req.ticket;
                     }
 
                     req.state = RequestState::COMPLETED;
@@ -447,9 +500,8 @@ private:
                 break;  // All hardware queue slots occupied
             }
 
-            // Need tile to be in L3 (TagCAM match)
-            auto entry = l3_tag_cam_.match(req.tile.tile_id);
-            if (!entry.has_value()) {
+            // Need this store's ticket in the buffer (a BlockMover ejected it there)
+            if (!store_buffer_.staged(req.ticket)) {
                 if (!tag_stalled) {
                     tag_stalled = true;
                     stalled_tile = req.tile.tile_id;
@@ -457,11 +509,16 @@ private:
                 continue;  // Try other requests
             }
 
-            // Tile is in L3 - submit to MC with our engine_id
+            // Another store of this tile is being written by this engine: wait for it
+            if (submitted_store_tiles_.count(req.tile.tile_id) > 0) continue;
+
+            // Tile is in the buffer - submit to MC with our engine_id
             if (!mc_.submit_request(req.tile, false, config_.engine_id)) {
                 // MC queue full - retry later
                 continue;
             }
+            store_buffer_.take(req.ticket);   // the slot stays held until the write ends
+            submitted_store_tiles_.insert(req.tile.tile_id);
 
             req.state = RequestState::SUBMITTED;
             ++in_flight;

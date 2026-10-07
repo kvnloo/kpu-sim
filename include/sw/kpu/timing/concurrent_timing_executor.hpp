@@ -101,6 +101,10 @@ public:
 
         // DMA Engine configuration
         size_t dma_queue_depth = 32;        ///< DMA request queue depth
+        /// Tiles each DMA engine's store buffer holds. A STORE is a BlockMover ejecting the
+        /// tile out of L3 into this buffer, then the engine writing it to DRAM (every hop is
+        /// a push; the engine never reads L3). It is the NoC port's per-engine output queue.
+        size_t dma_store_buffer_blocks = 2;
 
         // L3 configuration
         size_t l3_buffer_count = 32;      ///< Number of L3 buffers
@@ -435,7 +439,7 @@ public:
 
     void clear_tile_payloads() {
         dram_payloads_.clear(); l3_payloads_.clear(); l2_payloads_.clear();
-        l1_payloads_.clear(); compute_payloads_.clear();
+        l1_payloads_.clear(); compute_payloads_.clear(); store_payloads_.clear();
     }
 
     // ========================================================================
@@ -566,6 +570,9 @@ private:
     };
     using PayloadStore = std::unordered_map<TileID, StoredPayload, TileIDHash>;
     PayloadStore dram_payloads_, l3_payloads_, l2_payloads_, l1_payloads_, compute_payloads_;
+    // The bytes of each store between its ejection and its retirement, by store ticket: two
+    // stores of one tile in flight at once are two entries.
+    std::unordered_map<uint64_t, StoredPayload> store_payloads_;
     bool functional_payloads_enabled_ = false;
 
     // Component processes
@@ -743,6 +750,7 @@ inline void ConcurrentTimingExecutor::create_components() {
             ? 0
             : Config::clamp_reserve(
                   config_.l3_writeback_credit_reserve, config_.l3_buffer_count);
+        dma_config.store_buffer_blocks = config_.dma_store_buffer_blocks;
         dma_config.name = dma_config.display_name();
 
         // Assign DMA to MC: as declared, else round-robin if more DMAs than MCs.
@@ -839,7 +847,12 @@ inline void ConcurrentTimingExecutor::schedule_store(const TileDescriptor& tile,
     uint32_t dma = (engine_id >= 0)
         ? static_cast<uint32_t>(engine_id)
         : select_dma_engine(tile);
-    dma_engines_[dma % dma_engines_.size()]->schedule_store(tile);
+    // Push-only writeback: the engine writes from its store buffer, and the BlockMover that
+    // owns the tile ejects it there out of L3 (the mover the tile's writeback hashes to).
+    auto& engine = *dma_engines_[dma % dma_engines_.size()];
+    const uint64_t ticket = engine.schedule_store(tile);
+    block_movers_[select_block_mover(tile) % block_movers_.size()]->schedule_eject(
+        tile, engine.store_buffer(), ticket);
 }
 
 inline void ConcurrentTimingExecutor::schedule_move(const TileDescriptor& tile, bool transpose, int mover_id) {
@@ -1252,6 +1265,7 @@ inline void ConcurrentTimingExecutor::reset() {
     l2_payloads_.clear();
     l1_payloads_.clear();
     compute_payloads_.clear();
+    store_payloads_.clear();
 
     for (auto& mc : memory_controllers_) {
         mc->reset();
@@ -1424,9 +1438,31 @@ inline void ConcurrentTimingExecutor::apply_payload_event(const TimingEvent& eve
         case EventType::BM_WRITEBACK_COMPLETE:
             copy_payload(MemoryLevel::L2, MemoryLevel::L3, event.tile_id, event.slot_id);
             break;
-        case EventType::DMA_STORE_COMPLETE:
-            copy_payload(MemoryLevel::L3, MemoryLevel::DRAM, event.tile_id, event.slot_id);
+        case EventType::BM_EJECT_COMPLETE: {
+            // L3 -> this store's buffer entry, before CREDIT_RELEASED retires the L3 bytes.
+            auto it = l3_payloads_.find(event.tile_id);
+            if (it != l3_payloads_.end()) {
+                store_payloads_[event.store_ticket] = it->second;
+            } else if (functional_payloads_enabled_) {
+                throw std::runtime_error("Ejection completed without L3 bytes for " +
+                                         event.tile_id.to_string());
+            }
             break;
+        }
+        case EventType::DMA_STORE_RETIRED: {
+            // This store's own bytes -> DRAM; its buffer entry is gone.
+            auto it = store_payloads_.find(event.store_ticket);
+            if (it != store_payloads_.end()) {
+                StoredPayload p = std::move(it->second);
+                p.arrival_cycle = current_cycle_;
+                dram_payloads_[event.tile_id] = std::move(p);
+                store_payloads_.erase(it);
+            } else if (functional_payloads_enabled_) {
+                throw std::runtime_error("Store retired without buffered bytes for " +
+                                         event.tile_id.to_string());
+            }
+            break;
+        }
         case EventType::CREDIT_RELEASED:
             // Component processes update TagCAM ref-counts before emitting the
             // event. Retire bytes only when the final reference disappeared.

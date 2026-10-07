@@ -355,13 +355,35 @@ Each step is one PR.
      - `program/value_tolerance.hpp` is the §7 answer 5 comparator.
      - The oracle passes the ADR bar on all three devices, and is bit-identical too: `fill()`'s
        inputs keep every product and partial sum exact, so accumulation order cannot round.
-2. **4b.2, push-only writeback in the CSP tier** (step 3's vocabulary, without the NoC).
+2. **4b.2, push-only writeback in the CSP tier** (step 3's vocabulary, without the NoC). (Done.)
    - A BlockMover ejects a written-back tile from L3 into its DMA engine's buffer, then frees
      the L3 slot.
    - The DMA engine writes that buffer to DRAM, so a STORE no longer reads L3.
    - New events `BM_EJECT_START/COMPLETE`, and the L3->DRAM value copy moves to the ejection.
    - **This changes CSP timing**, as step 3 did at L-T1. The oracle and the regression
      baselines are re-pinned in the same PR.
+   - As built:
+     - `DmaStoreBuffer` (in `dma_engine_process.hpp`) is the engine's store buffer: the NoC
+       port's per-engine output queue, `Config::dma_store_buffer_blocks`, default 2.
+       `csp_config_from` maps a declared `noc.port.output_queue_blocks` onto it.
+     - The BlockMover's third leg, `schedule_eject`, runs after move and writeback. A stalled
+       writeback therefore lets an ejection run and free L3. An ejection's stall counts only in
+       a tick no other leg stalled in, which keeps one stall per mover per cycle.
+     - **Every store is a ticket.** `DMAEngineProcess::schedule_store` issues one, the
+       ejection carries it, and the buffer stages it. Two stores of one tile are two tickets,
+       two slots and two writes.
+       - The bytes live under the ticket from `BM_EJECT_COMPLETE`, which runs before
+         `CREDIT_RELEASED` retires L3, until the engine's `DMA_STORE_RETIRED` moves them to
+         DRAM.
+       - An engine writes one store of a tile at a time. The MC's completion names the tile, not
+         the store, so this keeps the match unambiguous and write-after-write in order.
+       - Found in review: keyed by tile, overlapping stores of one tile collided.
+     - The ejecting mover is the one the tile's writeback hashes to (`select_block_mover`).
+       4b.3 replaces that with the tile's home L3 tile.
+     - Measured on the ResNet-18 regression: total cycles rise 7-10%, from the ejection's
+       BlockMover time. DMA stall cycles rise about 4x, because a store now waits for its
+       ejection instead of reading L3 on a tag match. Only timing keys changed; the values
+       oracle stays bit-identical.
 3. **4b.3, L3 placement.** Every block gets a **home L3 tile** (Q10).
    - The L3 credit pool and TagCAM split per L3 tile (`capacity_tiles / l3.tiles` each). A load
      needs its home tile's credit.
