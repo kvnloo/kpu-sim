@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The T16 deployment (`tests/program/deploy/kpu_t16.json`).** A 4x4 checkerboard with 8 L3
+  and 8 compute tiles, 2 memory controllers with 16 DMA engines, and 24 BlockMovers. It is the
+  smallest board whose folded torus has proper rings: two row loops and two column loops of
+  four hubs each, over 12 wires with 8 fold-end ports. The T4's row and column loops are the
+  same two-hub ring, so every T4 channel is a fold link and nothing ever passes through a port.
+  The T16 is where ring-through traffic exists. Tested:
+  - its layout and floorplan, including the `kpu-floorplan` round trip;
+  - NoC routing;
+  - a ring-through block crossing a port before a queued injection;
+  - saturated injection mixed with L3 -> L3 moves, live with every block delivered.
+
+- **The CSP NoC fabric (NoC port plan step 4a, `include/sw/kpu/timing/noc_*.hpp`).** Hubs and
+  port controllers as CSP processes on the folded torus, on their own; wiring into the
+  executor is step 4b.
+  - `NocHubProcess`: store-and-forward, with a queue per ring input and entry queues for blocks
+    from the L3 and from ports.
+  - `NocPortProcess`: per-engine input and output queues, and the injection and ejection
+    buses, each holding one block (TF-PORT-1). The arbiter is ring first, then the oldest head,
+    and stateless. It derives the §3.4 output depth and charges every ejection stall to rate or
+    depth (TF-PORT-2), and it measures the injection wait (TF-PORT-3).
+  - `NocTopology`: dimension-ordered shortest routing.
+  - `NocFabric`: owns the processes and fixes the tick order. Its entry points are inject,
+    eject and L3 -> L3 transfer, and `Config::from` reads the spec.
+- **The plan's liveness test deadlocked the design as first written.** With four shared buffers
+  per hub, the saturated T64 deadlocked on every seed, with greedy injection and with the bubble
+  fallback alike. Adopted on review (Q7): dimension-ordered routing, per-input ring queues, entry
+  queues outside the rings, and the bubble rule on ring entry and on turns. The saturated T64
+  now drains, and so does mixed inject/eject/move traffic. One slot per input without the bubble
+  wedges under same-ring traffic.
+  - `noc.hub_buffer_blocks` must now be a multiple of 4 and at least 8 (two per input). The T4
+    and T64 fixtures declare 8.
+  - At 8, the bubble costs about a third of saturation throughput; at 16 the cost is gone.
+    Recorded in plan §3.5. The fixtures will move to 16 and the entry-queue depth will become a
+    spec field (Q8, Q9). The cause of the cost at 8 is open for investigation (plan §7).
+
 - **Every hop is a push (NoC port plan step 3, `.tflow` version 3).** Writeback no longer
   ends in `DmaL3ToDram`, a DMA read of L3 the push machine does not have. It is now two legs:
   - `BlockMoverL3ToDmaBuffer`: a BlockMover ejects the block from L3 into a DMA engine buffer,
