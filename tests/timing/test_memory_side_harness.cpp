@@ -10,10 +10,17 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <sw/kpu/program/platform/deployment_json.hpp>
+#include <sw/kpu/program/record/memory_flow_record.hpp>
 #include <sw/kpu/timing/memory_side_harness.hpp>
 #include <sw/kpu/timing/schedule/matmul_schedule_generator.hpp>
 
+#include <filesystem>
+#include <limits>
+#include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -217,5 +224,122 @@ TEST_CASE("Harness: requests are offered when due, whichever stream they came fr
         if (r.address >= 0x200000) CHECK(r.offered == 0);
         else CHECK(r.offered == 1000 * ((r.address - 0x100000) / 4096));
     }
+}
+
+// ============================================================================
+// Step 3: the run as a .mflow record
+// ============================================================================
+TEST_CASE("Record: a harness run round-trips through .mflow, and every row names what it should",
+          "[timing][memside][record]") {
+    namespace rec = sw::kpu::program::record;
+    const DeviceSpecification d = t4();
+    MemorySideHarness::Config c;
+    MemorySideHarness probe(d, c);
+    const unsigned port = probe.port_of(0);
+    c.streams = {{port, stream(32), 0}, {port, stream(16, false, 0x800000), 0}};
+    MemorySideHarness h(d, c);
+    REQUIRE(h.run());
+    const rec::MemoryFlowRecord r = to_record(h, d.name);
+
+    // Stations: 2 channels x 16 banks, 2 buses, 8 engines, 8 store buffers, 1 port.
+    std::map<std::string, std::size_t> kinds;
+    for (const auto& s : r.stations) ++kinds[s.kind];
+    CHECK(kinds["dram_bank"] == 32);
+    CHECK(kinds["dram_bus"] == 2);
+    CHECK(kinds["dma"] == 8);
+    CHECK(kinds["dmabuf"] == 8);
+    CHECK(kinds["port"] == 1);
+
+    // Integrity: commands name bursts (a refresh names none), bursts name requests, and each
+    // request's bursts are exactly the ones its bytes span.
+    std::vector<std::size_t> per_request(r.requests.size(), 0);
+    for (const auto& b : r.bursts) {
+        REQUIRE(b.request < r.requests.size());
+        ++per_request[b.request];
+        CHECK(b.engine == r.requests[b.request].engine);
+        CHECK(b.is_load == r.requests[b.request].is_load);
+    }
+    for (std::size_t i = 0; i < r.requests.size(); ++i) CHECK(per_request[i] == r.requests[i].bytes / 64);
+    for (const auto& cmd : r.commands) {
+        if (cmd.kind == rec::MemoryFlowRecord::CommandKind::Refresh) {
+            CHECK(cmd.burst == rec::kNone);
+            continue;
+        }
+        REQUIRE(cmd.burst < r.bursts.size());
+        const auto& b = r.bursts[cmd.burst];
+        CHECK((b.mc == cmd.mc && b.channel == cmd.channel && b.bank_group == cmd.bank_group && b.bank == cmd.bank));
+        if (cmd.kind != rec::MemoryFlowRecord::CommandKind::Precharge) CHECK(b.row == cmd.row);
+    }
+
+    const std::string dir = "memside_record_roundtrip.mflow";
+    rec::write_mflow(r, dir);
+    const rec::MemoryFlowRecord back = rec::read_mflow(dir);
+    CHECK(back.device == r.device);
+    CHECK(back.makespan == r.makespan);
+    CHECK(back.window == r.window);
+    CHECK(back.stations.size() == r.stations.size());
+    REQUIRE(back.bursts.size() == r.bursts.size());
+    REQUIRE(back.commands.size() == r.commands.size());
+    REQUIRE(back.requests.size() == r.requests.size());
+    CHECK(back.buffers.size() == r.buffers.size());
+    CHECK(back.ports.size() == r.ports.size());
+    for (std::size_t i = 0; i < r.bursts.size(); ++i) {
+        CHECK(back.bursts[i].row == r.bursts[i].row);
+        CHECK(back.bursts[i].outcome == r.bursts[i].outcome);
+        CHECK(back.bursts[i].done == r.bursts[i].done);
+    }
+    for (std::size_t i = 0; i < r.commands.size(); ++i) {
+        CHECK(back.commands[i].kind == r.commands[i].kind);
+        CHECK(back.commands[i].burst == r.commands[i].burst);
+        CHECK(back.commands[i].issue == r.commands[i].issue);
+    }
+    for (std::size_t i = 0; i < r.requests.size(); ++i) CHECK(back.requests[i].address == r.requests[i].address);
+    CHECK(std::filesystem::exists(dir + "/lod.json"));
+
+    // A bundle of another format or version is refused by name.
+    {
+        std::ofstream m(dir + "/manifest.json");
+        m << R"({"format":"kpu-mflow","version":99})";
+    }
+    CHECK_THROWS_WITH(rec::read_mflow(dir), ContainsSubstring("version 99"));
+    {
+        std::ofstream m(dir + "/manifest.json");
+        m << R"({"format":"kpu-tflow","version":3})";
+    }
+    CHECK_THROWS_WITH(rec::read_mflow(dir), ContainsSubstring("not a .mflow bundle"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Record: the reader refuses a time that is not a cycle count, and an index past its table",
+          "[timing][memside][record]") {
+    namespace rec = sw::kpu::program::record;
+    const DeviceSpecification d = t4();
+    MemorySideHarness::Config c;
+    MemorySideHarness probe(d, c);
+    c.streams = {{probe.port_of(0), stream(4), 0}};
+    MemorySideHarness h(d, c);
+    REQUIRE(h.run());
+    const std::string dir = "memside_reader_refusals.mflow";
+
+    SECTION("a NaN in a time column") {
+        rec::write_mflow(to_record(h, d.name), dir);
+        const auto m = nlohmann::json::parse(std::ifstream(dir + "/manifest.json"));
+        std::size_t off = 0;
+        for (const auto& col : m["tables"]["bursts"]["columns"])
+            if (col["name"] == "t_done") off = col["offset"].get<std::size_t>();
+        std::fstream f(dir + "/bursts.bin", std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(static_cast<std::streamoff>(off));
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        f.write(reinterpret_cast<const char*>(&nan), sizeof nan);
+        f.close();
+        CHECK_THROWS_WITH(rec::read_mflow(dir), ContainsSubstring("not a cycle count"));
+    }
+    SECTION("a burst naming a request past the requests table") {
+        auto r = to_record(h, d.name);
+        r.bursts.front().request = static_cast<std::uint32_t>(r.requests.size() + 5);
+        rec::write_mflow(r, dir);
+        CHECK_THROWS_WITH(rec::read_mflow(dir), ContainsSubstring("past the requests table"));
+    }
+    std::filesystem::remove_all(dir);
 }
 
