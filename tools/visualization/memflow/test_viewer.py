@@ -96,7 +96,7 @@ class ViewerSmokeTest(unittest.TestCase):
             "  const b = fs.readFileSync(path.join(dir, t.file));",
             "  files[t.file] = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }",
             "const R = parse(files);",
-            "const used = { B: ['mc','channel','bank_group','bank','row','col','engine','request','is_load','outcome','t_submit','t_cmd','t_data0','t_data1','t_done'],",
+            "const used = { B: ['mc','channel','bank_group','bank','row','col','engine','request','is_load','outcome','t_posted','t_submit','t_cmd','t_data0','t_data1','t_done'],",
             "  C: ['mc','channel','bank_group','bank','row','kind','burst','t_issue','t_end','t_data0','t_data1'],",
             "  Q: ['engine','port','is_load','address','bytes','t_offered','t_credit','t_first','t_last','t_retired'],",
             "  F: ['engine','held','staged','t'], P: ['port','request','kind','t'] };",
@@ -119,6 +119,17 @@ for (const c of [{ name: "x", dtype: "u16", offset: 0 }, { name: "x", dtype: "f6
 }
 process.stdout.write(JSON.stringify(out));"""])
         self.assertEqual(self.node(src), ["column x has an unknown dtype u16", "column x is misaligned"])
+
+    def test_record_strings_never_become_markup(self):
+        # The manifest's strings reach innerHTML (chips, inspector, observations): each must be
+        # escaped, and an arbitration the format does not know must be refused by name.
+        out = self.node("\n".join([extract(self.page, "function esc(v) {"), """
+process.stdout.write(JSON.stringify([esc('<img src=x onerror=alert(1)>'), esc("a&b\\"'"), esc(42)]));"""]))
+        self.assertEqual(out, ["&lt;img src=x onerror=alert(1)&gt;", "a&amp;b&quot;&#39;", "42"])
+        for sink in ("const kv = ", "const chip = ", '$("obs").innerHTML'):
+            line = next(l for l in self.page.splitlines() if sink in l)
+            self.assertIn("esc(", line, f"{sink} writes record strings without esc")
+        self.assertIn('m.arbitration !== "round_robin" && m.arbitration !== "fixed"', self.page)
 
     def test_the_step_series_counts_in_flight(self):
         src = "\n".join([extract(self.page, "function stepSeries(intervals) {"),
